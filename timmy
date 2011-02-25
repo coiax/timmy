@@ -1,0 +1,169 @@
+#!/usr/cslib/projects/prefix/usr/bin/python -i
+
+# You should be running this inside something with all the tools
+# that a Gentoo prefix requires, ie. inside another prefix.
+
+# If you're trying to bootstrap a Prefix without all the required
+# stuff, then you'll want to call PrefixBuilder.bootstrap_all()
+# http://www.gentoo.org/proj/en/gentoo-alt/prefix/bootstrap-solaris.xml
+
+import os
+import os.path
+import sys
+import tempfile
+import argparse #Yes, it's python2.7 wooooo
+import subprocess
+
+__doc__="""This is a tiny wrapper script, which given a path to build a prefix,
+builds a Gentoo Prefix."""
+
+PKGDIR="/usr/cslib/alt/packages"
+BOOTSTRAP_SCRIPT="/usr/cslib/alt/timmy/bootstrap-prefix.sh"
+# Default value of PKGDIR, and BOOSTRAP_SCRIPT
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('directory',metavar='DIR',nargs='?',type=str,help='Selected directory for prefixing. If none, then a random directory is created.',default=None)
+parser.add_argument('-p','--pkgdir',metavar='PKGDIR',type=str,help='Package directory, containing Prefix packages.',default=PKGDIR)
+parser.add_argument('-s','--script',help='Location of Gentoo Prefix bootstrap script.',default=BOOTSTRAP_SCRIPT)
+
+args = parser.parse_args()
+
+if args.directory is None:
+    tmpdir = tempfile.mkdtemp(prefix='prefix')
+    print "Bootstrapping into {}".format(tmpdir)
+    args.directory = tmpdir
+
+
+class PrefixBuilder(object):
+    def __init__(self,directory,pkgdir,bootstrapscript,quiet=False,usepkg=True):
+        self.quiet = quiet
+        self.dir = directory
+        self.pkgdir = pkgdir
+        self.usepkg = usepkg
+        self.bootstrapscript = bootstrapscript
+    def usepkg_get(self):
+        if self._usepkg:
+            return "--usepkg "
+        else:
+            return ""
+    def usepkg_set(self,boolz):
+        self._usepkg = boolz
+    usepkg = property(usepkg_get,usepkg_set)
+
+    def die(self,reason="No reason given.",exitcode=1):
+        # Although I hate myself for making such a function, it's very useful
+        # to have. Call this if something breaks, and specify a reason.
+        print >> sys.stderr, reason
+        sys.exit(exitcode)
+
+    # Now we need a new convienience helper function to help us compile stuff.
+    # and when I say that, I mean I'm suddenly lazy.
+    def run(self,command):
+        if self.quiet:
+            stdout=subprocess.PIPE
+            stderr=subprocess.PIPE
+        else:
+            stdout=None
+            stderr=None
+        return subprocess.Popen(
+            args=command,
+            stdout=stdout,
+            stderr=stderr,
+            shell=True,
+        )
+    def fix_path(self):
+        # Append the eprefix's /bin and /usr/bin etc. directories to the PATH
+        os.environ['PATH'] = '$EPREFIX/usr/bin:$EPREFIX/bin:$EPREFIX/tmp/usr/bin:$EPREFIX/tmp/bin:'.replace('$EPREFIX',self.dir) + os.environ['PATH']
+    # $ ./bootstrap-prefix.sh $EPREFIX tree
+    def create_tree(self):
+        tree_process = self.run("{} {} tree".format(self.bootstrapscript,self.dir))
+        return tree_process.wait()
+    def bootstrap_all(self):
+        results = []
+        for i in range(len(self.bootstrap_prereq)):
+            result = self.bootstrap_i(i)
+            results.append(result)
+            if result != 0:
+                break
+        return results
+        
+    def bootstrap_i(self,i):
+        return self.run("{} {}/tmp {}".format(self.bootstrapscript,self.dir,self.bootstrap_prereq[i])).wait()
+
+    def bootstrap_portage(self):
+        portage_process = self.run("{} {} portage".format(self.bootstrapscript,self.dir))
+        return portage_process.wait()
+
+    # Now, we make a symlink from EPREFIX/usr/portage/packages to our
+    # binpkgdir. Remember, symlinks are weird.
+    def symlink_binpkgdir(self):
+        #FIXME Probably a cleaner way of doing that, but this works fine.
+        os.chdir(self.dir)
+        os.chdir("./usr/portage")
+        # makes a symlink called packages, pointing to the pkgdir. Symlinks are
+        # always relative, and never absolute.
+        os.symlink(os.path.relpath(self.pkgdir,"."),'packages')
+
+    # To avoid circular dependencies, we install binutils-config, file,
+    # and then we can safely emerge portage completely, allowing the prefix
+    # to stand on its own.
+    def emerge_binutils_config(self):
+        return self.run("emerge " + self.usepkg + "--oneshot --nodeps binutils-config").wait()
+    def emerge_file(self):
+        return self.run("emerge " + self.usepkg + " --oneshot --nodeps file").wait()
+
+    #####################################
+    #              OR                   #
+    #####################################
+    # we don't cheat, and do each thing in order.
+    def emerge_all_prereq(self):
+        results = []
+        for i in range(len(self.prereq)):
+            result = self.emerge_i_prereq(i)
+            results.append(result)
+            if result != 0:
+                break
+        return results
+
+    def emerge_i_prereq(self,i):
+        return self.run("emerge " + self.usepkg + self.prereq[i]).wait()
+
+    # Okay, now the big shot stuff.
+    def emerge_portage(self):
+        return self.run("""FEATURES="-collision-protect" emerge """ + self.usepkg + """--oneshot sys-apps/portage""").wait()
+
+    def remove_temptools(self):
+        return self.run("rm -rf {}/tmp/*".format(self.dir)).wait()
+
+    def clear_shell_hash(self):
+        return self.run("hash -r").wait()
+
+    # Now we sync the portage tree, by rsync'ing /usr/cslib/alt/portage
+    # It ignores the binary packages.
+    def sync_local_tree(self):
+        #FIXME Currently doesn't work, because sync'ing the tree deletes old stuff that doesn't exist
+        # and the rsync command used doesn't delete stuff.
+        os.chdir(self.dir)
+        os.chdir("./usr/portage")
+        return self.run("rsync --recursive --links --safe-links --perms --times --compress --force --whole-file --delete --stats --timeout=180 --exclude=/distfiles --exclude=/local --exclude=/packages .").wait()
+    def sync_tree(self):
+        return self.run("emerge --sync").wait()
+    def update_system(self):
+        return self.run("USE=-git emerge " + self.usepkg + "--update system").wait()
+    def rebuild_system(self):
+        return self.run("emerge --emptytree system").wait()
+    def create_startscript(self):
+        return self.run("{} {} startscript".format(self.bootstrapscript,self.dir)).wait()
+    prereq = ['-1 sed','-1 -O bash','-1 wget','-1 -O baselayout-prefix',
+              '-1 -O xz-utils','-1 -O m4','-1 -O flex',
+              '-1 -O bison','-1 -O binutils-config','-1 -O binutils',
+              '-1 -O gcc-config','''-1 -O "=gcc-4.2*"''',
+              '-1 coreutils','-1 findutils','-1 tar','-1 grep',
+              '-1 patch','-1 gawk','-1 make','-1 -O file',
+              '-1 -O eselect','-1 pax-utils']
+    bootstrap_prereq = ['make','wget','sed','python','coreutils',
+                        'findutils5','tar','patch','grep','gawk',
+                        'bash','zlib']
+
+
+p = PrefixBuilder(args.directory,args.pkgdir,os.path.abspath(args.script),quiet=False)
